@@ -1,120 +1,87 @@
-import streamlit as st
-import pandas as pd
-import joblib
+# app.py – “full” adaptive satellite/drone dehazing
+import streamlit as st, cv2, numpy as np, io
+from PIL import Image
 
-# ─── Load Data ─────────────────────────────────────────
-df = joblib.load('movie_df.pkl')          # DataFrame with all movie meta
-cosine_sim = joblib.load('cosine_sim.pkl')
-indices     = joblib.load('indices.pkl')   # title ➜ df‑index mapping (lower‑case)
+st.set_page_config(page_title="Full Dehazing", layout="centered")
+st.title("🛰️  Full Satellite / Drone Image Dehazing (Multi‑scale DCP)")
 
-# ─── Page config + CSS ─────────────────────────────────
-st.set_page_config(page_title="🎬 Movie Recommender", layout="wide")
+# ----------- adaptive presets -------------
+PRESETS = {
+    "thin":     dict(win=[15,35], omega=0.85, t0=0.06, pct=0.0008, r=30, eps=1e-3),
+    "moderate": dict(win=[15,35,55], omega=0.9, t0=0.04, pct=0.0015, r=45, eps=1e-3),
+    "thick":    dict(win=[35,55,75], omega=1.0, t0=0.02, pct=0.0025, r=60, eps=2e-3),
+}
 
-st.markdown(
-    """
-    <style>
-        body {
-            background: linear-gradient(135deg,#0f2027,#203a43,#2c5364);
-            color:white;
-        }
-        .movie-card{
-            background:rgba(255,255,255,.05);
-            padding:1rem;border-radius:10px;margin:10px;text-align:center;
-        }
-        .movie-detail{
-            background:rgba(255,255,255,.10);
-            padding:1rem;border-radius:10px;
-        }
-        img{border-radius:10px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ----------- core functions ---------------
+def dark_channel(img, size):
+    return cv2.erode(np.min(img,2), cv2.getStructuringElement(cv2.MORPH_RECT,(size,size)))
 
-# ─── Recommender helper ─────────────────────────────────
+def multi_scale_dark(img, sizes):
+    chans=[dark_channel(img,s) for s in sizes]
+    return np.min(np.stack(chans,0),0)
 
-def recommend_movies(title: str) -> pd.DataFrame:
-    """Return top‑10 similar movies as DataFrame (empty if not found)."""
-    title = title.lower()
-    if title not in indices:
-        return pd.DataFrame()
-    idx_entry = indices[title]
-    idx = idx_entry.iloc[0] if isinstance(idx_entry, pd.Series) else idx_entry
-    sims = cosine_sim[idx]
-    top_10 = sims.argsort()[::-1][1:11]  # skip the movie itself
-    return df.iloc[top_10]
+def atm_light(img, dark, pct):
+    h,w=dark.shape; n=max(int(h*w*pct),1)
+    idx=np.unravel_index(np.argsort(dark.ravel())[-n:],(h,w))
+    return np.mean(img[idx],0)
 
-# ─── Read query‑param if user clicked a poster ──────────
-qp = st.query_params
-selected_idx = int(qp.get("selected", ["-1"])[0])  # -1 ➜ nothing selected
+def transmission_est(img, A, omega, win):
+    return 1-omega*multi_scale_dark(img/A, win)
 
-# ─── Input field & search button ───────────────────────
-st.title("🎬 Movie Recommendation System")
-movie_name = st.text_input("Enter a movie name:", placeholder="e.g., The Godfather")
+def guided(I,p,r,eps):
+    mI=cv2.boxFilter(I,-1,(r,r)); mp=cv2.boxFilter(p,-1,(r,r))
+    cII=cv2.boxFilter(I*I,-1,(r,r)); cIp=cv2.boxFilter(I*p,-1,(r,r))
+    varI=cII-mI*mI; cov=cIp-mI*mp
+    a=cov/(varI+eps); b=mp-a*mI
+    return cv2.boxFilter(a,-1,(r,r))*I+cv2.boxFilter(b,-1,(r,r))
 
-if st.button("Get Recommendations") and movie_name.strip():
-    recs = recommend_movies(movie_name)
-    if recs.empty:
-        st.error("Movie not found in database.")
+def recover(img,A,t,t0): t=np.clip(t,t0,1)[:,:,None]; return np.clip((img-A)/t+A,0,1)
+
+def post_contrast(rgb):
+    # CLAHE + gamma 1.2
+    lab=cv2.cvtColor((rgb*255).astype(np.uint8),cv2.COLOR_RGB2LAB)
+    L,a,b=cv2.split(lab)
+    L=cv2.createCLAHE(clipLimit=1.5,tileGridSize=(8,8)).apply(L)
+    merged=cv2.merge((L,a,b))
+    out=cv2.cvtColor(merged,cv2.COLOR_LAB2RGB)/255.0
+    return np.power(out,1/1.2)
+
+def full_dehaze(img_rgb, level="moderate"):
+    p=PRESETS[level]
+    def single_pass(im):
+        I=im.astype(np.float32)/255.0
+        dark=multi_scale_dark(I,p['win'])
+        A=atm_light(I,dark,p['pct'])
+        t0=transmission_est(I,A,p['omega'],p['win'])
+        gray=cv2.cvtColor((I*255).astype(np.uint8),cv2.COLOR_RGB2GRAY)/255.0
+        t=guided(gray,t0,p['r'],p['eps'])
+        J=recover(I,A,t,p['t0'])
+        return (post_contrast(J)*255).astype(np.uint8), dark.mean()
+    out,dc_avg=single_pass(img_rgb)
+    # run a second pass if average dark‑channel still high
+    if dc_avg>0.15:
+        out,_=single_pass(out)
+    return out
+
+def resize(img,w=420):
+    h,w0=img.shape[:2]; return cv2.resize(img,(w,int(h*w/w0)),cv2.INTER_AREA)
+
+# ----------- Streamlit UI -----------------
+level=st.selectbox("Haze density",["thin","moderate","thick"])
+file =st.file_uploader("Upload hazy JPG/PNG",["jpg","jpeg","png"])
+
+if file:
+    bgr=cv2.imdecode(np.frombuffer(file.read(),np.uint8),cv2.IMREAD_COLOR)
+    if bgr is None:
+        st.error("❌ Could not decode image.")
     else:
-        # rewrite query‑params to clear previous selection
-        st.query_params.clear()
-        st.session_state["initial_recs"] = recs
-        selected_idx = -1  # reset selection
-
-# ─── Show initial recommendations grid ─────────────────
-if "initial_recs" in st.session_state:
-    recs: pd.DataFrame = st.session_state["initial_recs"]
-    st.subheader("Top 10 Similar Movies")
-    cols = st.columns(5)
-    for i, (row_idx, row) in enumerate(recs.iterrows()):
-        with cols[i % 5]:
-            st.markdown('<div class="movie-card">', unsafe_allow_html=True)
-            if pd.notna(row["poster_path"]):
-                poster = f"https://image.tmdb.org/t/p/w500{row['poster_path']}"
-                # clickable image ➜ adds ?selected=row_idx to URL, no new tab
-                st.markdown(
-                    f'<a href="?selected={row_idx}"><img src="{poster}" width="100%"></a>',
-                    unsafe_allow_html=True,
-                )
-            st.markdown(f"**🎞️ {row['original_title']}**")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-# ─── If user clicked a poster, show details + 10 more ──
-if selected_idx != -1 and selected_idx in df.index:
-    movie = df.loc[selected_idx]
-
-    st.markdown("---")
-    st.subheader(f"🎬 {movie['original_title']}")
-    detail_left, detail_right = st.columns([1,2])
-
-    with detail_left:
-        if pd.notna(movie['poster_path']):
-            st.image(f"https://image.tmdb.org/t/p/w500{movie['poster_path']}",
-                     use_container_width=True)
-
-    with detail_right:
-        st.markdown('<div class="movie-detail">', unsafe_allow_html=True)
-        st.markdown(f"📅 **Release Date:** {movie['release_date']}")
-        st.markdown(f"🗣️ **Language:** {movie['original_language']}")
-        st.markdown(f"🎭 **Genres:** {movie['genres']}")
-        overview = movie['overview'] if pd.notna(movie['overview']) else "No overview available."
-        st.markdown(f"📝 **Overview:** {overview}")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # secondary recommendations (from clicked movie)
-    sub_recs = recommend_movies(movie['original_title'])
-    if not sub_recs.empty:
-        st.subheader(f"Movies similar to {movie['original_title']}")
-        sub_cols = st.columns(5)
-        for i, (ridx, rrow) in enumerate(sub_recs.iterrows()):
-            with sub_cols[i % 5]:
-                st.markdown('<div class="movie-card">', unsafe_allow_html=True)
-                if pd.notna(rrow['poster_path']):
-                    poster = f"https://image.tmdb.org/t/p/w500{rrow['poster_path']}"
-                    st.markdown(
-                        f'<a href="?selected={ridx}"><img src="{poster}" width="100%"></a>',
-                        unsafe_allow_html=True,
-                    )
-                st.markdown(f"**🎞️ {rrow['original_title']}**")
-                st.markdown("</div>", unsafe_allow_html=True)
+        rgb=cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB)
+        with st.spinner("Removing haze…"):
+            out=full_dehaze(rgb,level)
+        col1,col2=st.columns(2)
+        col1.image(resize(rgb),caption="Original",use_container_width=True)
+        col2.image(resize(out),caption="Dehazed",use_container_width=True)
+        buf=io.BytesIO(); Image.fromarray(out).save(buf,format="JPEG")
+        st.download_button("⬇️ Download",buf.getvalue(),"dehazed.jpg","image/jpeg")
+else:
+    st.info("Upload a hazy satellite / drone image to begin.")
