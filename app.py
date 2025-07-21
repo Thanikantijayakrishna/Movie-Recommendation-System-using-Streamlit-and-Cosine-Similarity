@@ -1,5 +1,10 @@
 # app.py – “full” adaptive satellite/drone dehazing
-import streamlit as st, cv2, numpy as np, io
+pip install opencv-python
+
+import streamlit as st
+import numpy as np
+import io
+
 from PIL import Image
 
 st.set_page_config(page_title="Full Dehazing", layout="centered")
